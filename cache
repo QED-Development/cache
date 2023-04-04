@@ -1,0 +1,199 @@
+import os
+import json
+import logging
+import hashlib
+from pathlib import Path
+import aiofiles
+from typing import Callable, Optional, Union
+
+from functools import wraps
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+
+
+@dataclass
+class Cache:
+    """
+    A Cache class to handle caching of function calls and their results.
+
+    Attributes:
+        serializer (Optional[Callable]): A callable object for serializing data, default is json.dumps.
+        deserializer (Optional[Callable]): A callable object for deserializing data, default is json.loads.
+        cache_folder (Optional[Path]): Path to the folder where cache files are stored, default is ".cache".
+        archive_folder (Optional[Path]): Path to the folder where expired cache files are archived, default is ".cache/archive".
+        cache_expiry (Optional[Union[timedelta, datetime]]): Time duration after which a cache is considered expired or a datetime
+            object after which all cache is considered expired, default is None.
+        logger (Optional[logging.Logger]): Target logger, default is logging.getLogger(__name__).
+
+    Methods:
+        __post_init__: Initialize the Cache object, validate its attributes, and create cache and archive folders if they don't exist.
+        _validate_cache_folder: Validate the cache folder path and create it if it doesn't exist.
+        _get_cache_filepath: Get the full path of a cache file.
+        _serialize_args: Serialize function arguments and return their hash.
+        _generate_cache_filename: Generate a cache filename based on the function name and its arguments.
+        _validate_filename: Validate a cache filename to ensure it doesn't contain invalid characters.
+        _handle_cache_files: Handle cache file paths and validate filenames.
+        _validate_expiry: Validate the cache_expiry attribute value.
+        _validate_logger: Validate the logger attribute value.
+        _load_cache: Load cache data from a cache file.
+        _save_cache: Save cache data to a cache file.
+        cleanup_expired_cache: Clean up expired cache files and move them to the archive folder.
+    """
+
+    serializer: Optional[Callable] = field(default=json.dumps)
+    deserializer: Optional[Callable] = field(default=json.loads)
+    cache_folder: Optional[Path] = field(default_factory=lambda: Path(".cache"))
+    archive_folder: Optional[Path] = field(
+        default_factory=lambda: Path(".cache/archive")
+    )
+    cache_expiry: Optional[Union[timedelta, datetime]] = field(default=None)
+    logger: Optional[logging.Logger] = field(
+        default_factory=lambda: logging.getLogger(__name__)
+    )
+
+    def __post_init__(self) -> None:
+        self._validate_cache_folder()
+        self._validate_expiry()
+        self._validate_logger()
+        self.logger.debug(f"Cache folder: {self.cache_folder}")
+
+    def _validate_cache_folder(self) -> None:
+        if not os.path.exists(self.cache_folder):
+            os.makedirs(self.cache_folder)
+
+    def _get_cache_filepath(self, filename: str) -> str:
+        return os.path.join(self.cache_folder, filename)
+
+    def _serialize_args(self, args: tuple, kwargs: dict) -> str:
+        args_string = json.dumps((args, kwargs), sort_keys=True, default=str)
+        return hashlib.md5(args_string.encode("utf-8")).hexdigest()
+
+    def _generate_cache_filename(
+        self, func_name: str, args: tuple, kwargs: dict
+    ) -> str:
+        args_hash = self._serialize_args(args, kwargs)
+        return f"{func_name}_{args_hash}.cache"
+
+    def _validate_filename(self, filename: str) -> bool:
+        return not any(c in filename for c in r'<>:"/\|?*')
+
+    async def _handle_cache_files(
+        self, func_name: str, args: tuple, kwargs: dict
+    ) -> str:
+        filename = self._generate_cache_filename(func_name, args, kwargs)
+        if not self._validate_filename(filename):
+            raise ValueError(f"Invalid characters in cache filename: {filename}")
+
+        cache_filepath = self._get_cache_filepath(filename)
+        return cache_filepath
+
+    def _validate_expiry(self):
+        if self.cache_expiry is not None and (
+            not (
+                isinstance(self.cache_expiry, timedelta)
+                or isinstance(self.cache_expiry, datetime)
+            )
+        ):
+            raise ValueError("cache_expiry must be a timedelta or datetime object")
+
+    def _validate_logger(self):
+        if not isinstance(self.logger, logging.Logger):
+            raise ValueError("logger must be an instance of logging.Logger")
+
+    async def _load_cache(self, cache_filepath, raise_on_deserialization_error=True):
+        if not os.path.exists(cache_filepath):
+            return None
+        try:
+            async with aiofiles.open(cache_filepath, mode="rb") as f:
+                data = await f.read()
+            if data:
+                return self.deserializer(data)
+            else:
+                return data.decode()
+        except Exception as e:
+            if raise_on_deserialization_error:
+                raise
+            else:
+                self.logger.warning(f"Cache deserialization failed: {e}")
+                return None
+
+    async def _save_cache(self, data, cache_filepath):
+        self.cleanup_expired_cache()
+        serialized_data: str = self.serializer(data)
+        async with aiofiles.open(cache_filepath, mode="wb") as f:
+            await f.write(serialized_data.encode())
+        self.logger.debug(f"Saved cache to {cache_filepath}")
+
+    async def cleanup_expired_cache(self) -> None:
+        """
+        Cleanup expired cache files.
+
+        """
+        if self.cache_expiry is None:
+            return
+        now = datetime.now()
+        archive_folder = self.archive_folder
+
+        if not os.path.exists(archive_folder):
+            os.makedirs(archive_folder)
+
+        for filename in os.listdir(self.cache_folder):
+            cache_filepath = self._get_cache_filepath(filename)
+
+            try:
+                st = os.stat(cache_filepath)
+
+            except OSError as e:
+                self.logger.error(
+                    f"Failed to stat {cache_filepath}: {e}", exc_info=True
+                )
+                continue
+
+            if (
+                self.cache_expiry is not None
+                and isinstance(self.cache_expiry, timedelta)
+                and (now - datetime.fromtimestamp(st.st_mtime)) > self.cache_expiry
+            ) or (
+                self.cache_expiry is not None
+                and isinstance(self.cache_expiry, datetime)
+                and (now > self.cache_expiry)
+            ):
+                archive_filepath = os.path.join(archive_folder, filename)
+                os.rename(cache_filepath, archive_filepath)
+                self.logger.debug(f"Archived expired cache file: {archive_filepath}")
+
+
+@dataclass
+class cached:
+    """
+    A decorator class for caching function calls and their results using a Cache object.
+
+    Attributes:
+        cache (Optional[Cache]): A Cache object for caching function calls, their results, and setting policy.
+
+    Methods:
+        __call__: Decorate a function and cache its calls and results.
+    """
+
+    cache: Optional[Cache] = None
+
+    def __call__(self, func):
+        cache = self.cache or Cache()
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            cache_filepath = await cache._handle_cache_files(
+                func.__name__, args, kwargs
+            )
+            result = await cache._load_cache(cache_filepath)
+            if result is None:
+                result = await func(*args, **kwargs)
+                await cache._save_cache(result, cache_filepath)
+            else:
+                cache.logger.debug(f"Cache hit: {cache_filepath}")
+            return result
+
+        return wrapper
