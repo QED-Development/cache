@@ -14,7 +14,7 @@ The repository will be initially populated by a Python module I've designed and 
 
 The purpose of this decorator is to automatically cache processing work at the function level to reduce system load for repeated function calls while not requiring any new or special changes to existing logic. Because the arguments are hashed, cached results for an add(x,y) function will dynamically pull the correct cache file for add(1,2) or add(2,2) and store the results seperately for each call.
 
-This cache decorator can be configured to handle different use cases using the Cache dataclass, . At the core this logic will automatically hash the target function's parameters and store the response use a configurable serializer.
+This cache decorator can be configured to handle different use cases using the Cache dataclass. At its core this logic will automatically hash the target function's parameters and store the response using a configurable serializer.
 
 ### Description
 
@@ -72,5 +72,4 @@ The default configuration and options for Cache are defined below:
 In this example a coroutine is decorated by the cached decorator and when called the first time the decorator will store the results in a file. Then for the next 30 days based on the cache file's creation timestamp the cache file will be returned rather than calling out to the openai API. 
 
 In functions with parameters like the second example, the args and kwargs are serialized and hashed as part of the cache file to support a keyed function to multiple cache file mapping.
-
 
